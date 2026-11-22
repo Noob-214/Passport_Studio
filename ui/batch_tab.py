@@ -1,6 +1,7 @@
 import os
+import queue
+import logging
 import threading
-import tempfile
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 from PIL import Image
@@ -22,26 +23,22 @@ COLOR_SELECTED_HOVER = "#238a5c"
 COLOR_UNSELECTED = "#3a3a3a"
 COLOR_UNSELECTED_HOVER = "#4a4a4a"
 
-
-def _thumb(path: str):
-    try:
-        img = Image.open(path)
-        img.thumbnail((THUMB_W, THUMB_H))
-        return ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
-    except Exception:
-        return None
+COLOR_CANCEL = "#c0392b"
+COLOR_CANCEL_HOVER = "#922b21"
 
 
 # ── customer card ────────────────────────────────────────────────────────────
 
 class CustomerCard(ctk.CTkFrame):
-    """One row in the customer list — clean stacked layout, no overlap."""
+    """One row in the customer list."""
 
     def __init__(self, master, index: int, on_remove, **kw):
         super().__init__(master, corner_radius=8, **kw)
         self.index = index
         self.on_remove = on_remove
         self.image_path: str | None = None
+        self.rotation = 0              # degrees clockwise: 0 / 90 / 180 / 270
+        self._thumb_base = None        # small unrotated PIL copy for the thumbnail
         self._copies = 12
         self.qty_buttons = {}
 
@@ -119,32 +116,76 @@ class CustomerCard(ctk.CTkFrame):
                       font=("Segoe UI", 14, "bold"),
                       command=self._increase).pack(side="left")
 
-        # ── Row C: action buttons
+        # ── Row C: select photo + rotate arrows (left), remove (right)
         row_c = ctk.CTkFrame(self, fg_color="transparent")
         row_c.pack(fill="x", padx=8, pady=(4, 8))
 
-        ctk.CTkButton(row_c, text="📂 Select Photo", width=140, height=30,
+        ctk.CTkButton(row_c, text="📂 Select Photo", width=130, height=30,
                       command=self._browse).pack(side="left")
+
+        ctk.CTkButton(row_c, text="↺", width=36, height=30,
+                      font=("Segoe UI", 16, "bold"),
+                      fg_color=COLOR_UNSELECTED,
+                      hover_color=COLOR_UNSELECTED_HOVER,
+                      command=lambda: self._rotate(-90)).pack(side="left", padx=(8, 2))
+        ctk.CTkButton(row_c, text="↻", width=36, height=30,
+                      font=("Segoe UI", 16, "bold"),
+                      fg_color=COLOR_UNSELECTED,
+                      hover_color=COLOR_UNSELECTED_HOVER,
+                      command=lambda: self._rotate(90)).pack(side="left", padx=2)
+
         ctk.CTkButton(row_c, text="✖ Remove", width=100, height=30,
-                      fg_color="#c0392b", hover_color="#922b21",
+                      fg_color=COLOR_CANCEL, hover_color=COLOR_CANCEL_HOVER,
                       command=lambda: self.on_remove(self)).pack(side="right")
 
         self._refresh_highlight()
 
-    # ── behavior ─────────────────────────────────────────────────────────────
+    # ── photo / rotation ─────────────────────────────────────────────────────
 
     def _browse(self):
         path = filedialog.askopenfilename(
             filetypes=[("Images", "*.jpg *.jpeg *.png")])
         if not path:
             return
+
+        try:
+            img = Image.open(path)
+            img.draft("RGB", (400, 400))     # fast decode for big JPEGs
+            img = img.convert("RGB")
+            img.thumbnail((260, 260))
+        except Exception as exc:
+            messagebox.showerror("Cannot open photo", str(exc))
+            return
+
         self.image_path = path
-        self.file_label.configure(
-            text=f"Customer {self.index + 1}  ·  {os.path.basename(path)}")
-        t = _thumb(path)
-        if t:
-            self.thumb_label.configure(image=t, text="")
-            self.thumb_label.image = t
+        self.rotation = 0
+        self._thumb_base = img
+        self._update_label()
+        self._render_thumb()
+
+    def _rotate(self, degrees):
+        if self._thumb_base is None:
+            return
+        self.rotation = (self.rotation + degrees) % 360
+        self._render_thumb()
+
+    def _render_thumb(self):
+        if self._thumb_base is None:
+            return
+        img = self._thumb_base
+        if self.rotation:
+            img = img.rotate(-self.rotation, expand=True)
+        img = img.copy()
+        img.thumbnail((THUMB_W, THUMB_H))
+        ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
+        self.thumb_label.configure(image=ctk_img, text="")
+        self.thumb_label.image = ctk_img
+
+    def _update_label(self):
+        name = os.path.basename(self.image_path) if self.image_path else "No photo selected"
+        self.file_label.configure(text=f"Customer {self.index + 1}  ·  {name}")
+
+    # ── photo count ──────────────────────────────────────────────────────────
 
     def _set_copies(self, value):
         self._copies = value
@@ -168,15 +209,18 @@ class CustomerCard(ctk.CTkFrame):
         for val, btn in self.qty_buttons.items():
             if val == self._copies:
                 btn.configure(fg_color=COLOR_SELECTED,
-                             hover_color=COLOR_SELECTED_HOVER)
+                              hover_color=COLOR_SELECTED_HOVER)
             else:
                 btn.configure(fg_color=COLOR_UNSELECTED,
-                             hover_color=COLOR_UNSELECTED_HOVER)
+                              hover_color=COLOR_UNSELECTED_HOVER)
+
+    # ── data ─────────────────────────────────────────────────────────────────
 
     def to_dict(self) -> dict:
         return {
             "image_path":       self.image_path,
             "copies":           self._copies,
+            "rotation":         self.rotation,
             "smart_crop":       self.smart_crop_var.get(),
             "white_background": self.white_bg_var.get(),
             "enhance":          self.enhance_var.get(),
@@ -185,8 +229,7 @@ class CustomerCard(ctk.CTkFrame):
 
     def renumber(self, new_index: int):
         self.index = new_index
-        name = os.path.basename(self.image_path) if self.image_path else "No photo selected"
-        self.file_label.configure(text=f"Customer {new_index + 1}  ·  {name}")
+        self._update_label()
 
 
 # ── main batch tab ───────────────────────────────────────────────────────────
@@ -204,6 +247,13 @@ class BatchTab(ctk.CTkFrame):
         self._cards: list[CustomerCard] = []
         self._results: list[dict] = []
         self._preview_index: int = 0
+
+        # background-job state
+        self._running = False
+        self._job_id = 0                   # bumped per job; stale results are ignored
+        self._cancel_event = None
+        self._msg_queue = queue.Queue()    # worker thread -> UI thread messages
+        self._poll_id = None
 
         self._build()
 
@@ -239,6 +289,9 @@ class BatchTab(ctk.CTkFrame):
         self.gen_btn = ctk.CTkButton(action_bar, text="⚙ Generate All",
                                      command=self._generate_all, width=175)
         self.gen_btn.pack(side="left")
+        # remember the normal colours so they can be restored after "Cancel" mode
+        self._gen_fg = self.gen_btn.cget("fg_color")
+        self._gen_hover = self.gen_btn.cget("hover_color")
 
         self.print_all_btn = ctk.CTkButton(
             action_bar, text="🖨 Print All",
@@ -248,7 +301,8 @@ class BatchTab(ctk.CTkFrame):
 
         self.status_label = ctk.CTkLabel(parent, text="",
                                          text_color="gray60",
-                                         font=("Segoe UI", 11))
+                                         font=("Segoe UI", 11),
+                                         wraplength=430)
         self.status_label.pack(pady=(0, 4))
 
     def _build_right(self, parent):
@@ -304,6 +358,8 @@ class BatchTab(ctk.CTkFrame):
         self._set_status(f"{len(self._cards)} customer(s)")
 
     def _clear_all(self):
+        if self._running:
+            self._cancel_generate()
         for c in list(self._cards):
             c.pack_forget()
             c.destroy()
@@ -312,9 +368,12 @@ class BatchTab(ctk.CTkFrame):
         self._reset_preview()
         self._set_status("Cleared")
 
-    # ── generation ──────────────────────────────────────────────────────────
+    # ── generation (background job, UI-thread safe) ─────────────────────────
 
     def _generate_all(self):
+        if self._running:
+            return
+
         if not self._cards:
             messagebox.showwarning("No Customers",
                                    "Please add at least one customer.")
@@ -329,22 +388,96 @@ class BatchTab(ctk.CTkFrame):
 
         customers = [c.to_dict() for c in self._cards]
 
-        self.gen_btn.configure(state="disabled", text="⏳ Generating…")
+        self._job_id += 1
+        job_id = self._job_id
+        cancel_event = threading.Event()
+        self._cancel_event = cancel_event
+        self._running = True
+
+        # the Generate button turns into a Cancel button while the job runs
+        self.gen_btn.configure(text="✖ Cancel",
+                               fg_color=COLOR_CANCEL,
+                               hover_color=COLOR_CANCEL_HOVER,
+                               command=self._cancel_generate)
         self.print_all_btn.configure(state="disabled")
         self.print_one_btn.configure(state="disabled")
         self.save_btn.configure(state="disabled")
-        self._set_status("Processing…")
+        self._set_status("⏳ Starting…")
+
+        def _progress(done, total, label):
+            self._msg_queue.put((job_id, "progress", (done, total, label)))
 
         def _worker():
-            results = generate_batch(customers)
-            self.after(0, lambda: self._on_generated(results))
+            # Whatever happens here, the UI is always told — an uncaught error
+            # in a thread would otherwise leave the app stuck on "Processing…".
+            try:
+                result = generate_batch(customers,
+                                        progress_cb=_progress,
+                                        cancel_event=cancel_event)
+                self._msg_queue.put((job_id, "done", result))
+            except Exception as exc:
+                logging.exception("Batch generation crashed")
+                self._msg_queue.put(
+                    (job_id, "crash", f"{type(exc).__name__}: {exc}"))
 
         threading.Thread(target=_worker, daemon=True).start()
+        self._schedule_poll()
+
+    def _schedule_poll(self):
+        if self._poll_id is not None:
+            try:
+                self.after_cancel(self._poll_id)
+            except Exception:
+                pass
+        self._poll_id = self.after(100, self._poll_queue)
+
+    def _poll_queue(self):
+        """Runs on the UI thread: drain messages sent by the worker thread."""
+        self._poll_id = None
+        try:
+            while True:
+                job_id, kind, payload = self._msg_queue.get_nowait()
+                if job_id != self._job_id:
+                    continue                      # leftover from a cancelled job
+
+                if kind == "progress":
+                    done, total, label = payload
+                    self._set_status(f"⏳ Processing {done + 1} of {total} — {label}…")
+
+                elif kind == "done":
+                    self._finish_job()
+                    self._on_generated(payload)
+                    return
+
+                elif kind == "crash":
+                    self._finish_job()
+                    self._set_status("❌ Generation failed")
+                    messagebox.showerror("Generation failed", payload)
+                    return
+        except queue.Empty:
+            pass
+
+        if self._running:
+            self._schedule_poll()
+
+    def _cancel_generate(self):
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+        self._job_id += 1          # anything the old job still sends is ignored
+        self._finish_job()
+        self._set_status("Cancelled")
+
+    def _finish_job(self):
+        """Put the Generate button back to normal."""
+        self._running = False
+        self._cancel_event = None
+        self.gen_btn.configure(text="⚙ Generate All",
+                               fg_color=self._gen_fg,
+                               hover_color=self._gen_hover,
+                               command=self._generate_all)
 
     def _on_generated(self, results):
-        # generate_batch may return either a dict {"combined_sheet":..,"errors":..}
-        # or a list of per-customer results depending on which batch_engine
-        # version is in use — handle both gracefully.
+        # generate_batch returns a dict {"combined_sheet": ..., "errors": [...]}
         if isinstance(results, dict):
             self._results = [results] if results.get("combined_sheet") else []
             errors = results.get("errors", [])
@@ -352,14 +485,12 @@ class BatchTab(ctk.CTkFrame):
             self._results = results
             errors = [r for r in results if r.get("error")]
 
-        self.gen_btn.configure(state="normal", text="⚙ Generate All")
-
         valid = self._valid_results()
 
         if errors:
             msgs = "\n".join(
-                f"• {e.get('label','?')}: {e.get('error','?')}" for e in errors)
-            messagebox.showerror("Some sheets failed", msgs)
+                f"• {e.get('label', '?')}: {e.get('error', '?')}" for e in errors)
+            messagebox.showerror("Some photos failed", msgs)
 
         if valid:
             self.print_all_btn.configure(state="normal")
@@ -367,12 +498,11 @@ class BatchTab(ctk.CTkFrame):
             self.save_btn.configure(state="normal")
             self._preview_index = 0
             self._show_preview(0)
-            self._set_status(
-                f"✅ {len(valid)} sheet(s) ready"
-                + (f" | ❌ {len(errors)} failed" if errors else ""))
+            self._set_status("✅ Sheet ready"
+                             + (f" | ❌ {len(errors)} failed" if errors else ""))
         else:
             self._reset_preview()
-            self._set_status("❌ All sheets failed")
+            self._set_status("❌ Nothing could be generated")
 
     # ── preview ──────────────────────────────────────────────────────────────
 
@@ -403,7 +533,7 @@ class BatchTab(ctk.CTkFrame):
         self.preview_label.configure(image=ctk_img, text="")
         self.preview_label.image = ctk_img
 
-        label = r.get("label", "Sheet")
+        label = r.get("label", "Combined Sheet")
         copies = r.get("copies", "")
         extra = f"  ({copies} photos)" if copies else ""
         self.preview_title.configure(
@@ -457,6 +587,7 @@ class BatchTab(ctk.CTkFrame):
                 try:
                     print_image(self._get_sheet(r))
                 except Exception as exc:
+                    logging.exception("Print failed")
                     self.after(0, lambda e=str(exc), lbl=r.get('label', '?'):
                                messagebox.showerror("Print Error",
                                                     f"{lbl}: {e}"))
@@ -479,7 +610,7 @@ class BatchTab(ctk.CTkFrame):
 
         saved, failed = 0, 0
         for r in valid:
-            label = r.get("label", "sheet")
+            label = r.get("label", "combined_sheet")
             safe_name = label.replace(" ", "_").replace("/", "-")
             out_path = os.path.join(folder, f"{safe_name}.jpg")
             try:
